@@ -153,9 +153,13 @@ func (g *GitHubNotification) GetTemplater(name string, f texttemplate.FuncMap) (
 		}
 	}
 
-	var pullRequestCommentContent *texttemplate.Template
+	var pullRequestCommentContent, pullRequestCommentTag *texttemplate.Template
 	if g.PullRequestComment != nil {
 		pullRequestCommentContent, err = texttemplate.New(name).Funcs(f).Parse(g.PullRequestComment.Content)
+		if err != nil {
+			return nil, err
+		}
+		pullRequestCommentTag, err = texttemplate.New(name).Funcs(f).Parse(g.PullRequestComment.CommentTag)
 		if err != nil {
 			return nil, err
 		}
@@ -309,12 +313,17 @@ func (g *GitHubNotification) GetTemplater(name string, f texttemplate.FuncMap) (
 				return err
 			}
 			notification.GitHub.PullRequestComment.Content = contentData.String()
-			notification.GitHub.PullRequestComment.CommentTag = g.PullRequestComment.CommentTag
 
-			if g.PullRequestComment.CommentTag != "" {
+			var commentTagData bytes.Buffer
+			if err := pullRequestCommentTag.Execute(&commentTagData, vars); err != nil {
+				return err
+			}
+			notification.GitHub.PullRequestComment.CommentTag = commentTagData.String()
+
+			if notification.GitHub.PullRequestComment.CommentTag != "" {
 				notification.GitHub.PullRequestComment.Content = fmt.Sprintf(contentFormat,
 					notification.GitHub.PullRequestComment.Content,
-					fmt.Sprintf(commentTagFormat, g.PullRequestComment.CommentTag))
+					fmt.Sprintf(commentTagFormat, notification.GitHub.PullRequestComment.CommentTag))
 			}
 		}
 
