@@ -276,7 +276,10 @@ func TestGetTemplater_Github_PullRequestCommentWithTag(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	assert.Equal(t, "This is a comment\n<!-- argocd-notifications test-tag -->", notification.GitHub.PullRequestComment.Content)
+	// Templating renders content and tag only; the marker is appended once at
+	// send time. Embedding it here too would double it in the posted comment.
+	assert.Equal(t, "This is a comment", notification.GitHub.PullRequestComment.Content)
+	assert.Equal(t, "test-tag", notification.GitHub.PullRequestComment.CommentTag)
 }
 
 func TestGetTemplater_Github_PullRequestCommentWithTemplatedTag(t *testing.T) {
@@ -312,7 +315,8 @@ func TestGetTemplater_Github_PullRequestCommentWithTemplatedTag(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	assert.Equal(t, "Deploy status for my-app\n<!-- argocd-notifications deploy-my-app -->", notification.GitHub.PullRequestComment.Content)
+	assert.Equal(t, "Deploy status for my-app", notification.GitHub.PullRequestComment.Content)
+	assert.Equal(t, "deploy-my-app", notification.GitHub.PullRequestComment.CommentTag)
 	assert.Equal(t, "deploy-my-app", notification.GitHub.PullRequestComment.CommentTag)
 }
 
@@ -371,6 +375,7 @@ func TestGitHubCheckRunNotification(t *testing.T) {
 // Mock implementations
 type mockIssuesService struct {
 	comments []*github.IssueComment
+	pageSize int // 0 = return all comments on one page (nil response)
 }
 
 type mockPullRequestsService struct {
@@ -454,8 +459,26 @@ func (m *mockPullRequestsService) ListPullRequestsWithCommit(_ context.Context, 
 }
 
 // Add these methods back
-func (m *mockIssuesService) ListComments(_ context.Context, _, _ string, _ int, _ *github.IssueListCommentsOptions) ([]*github.IssueComment, *github.Response, error) {
-	return m.comments, nil, nil
+func (m *mockIssuesService) ListComments(_ context.Context, _, _ string, _ int, opts *github.IssueListCommentsOptions) ([]*github.IssueComment, *github.Response, error) {
+	if m.pageSize <= 0 {
+		return m.comments, nil, nil
+	}
+	page := 1
+	if opts != nil && opts.Page > 0 {
+		page = opts.Page
+	}
+	start := (page - 1) * m.pageSize
+	if start >= len(m.comments) {
+		return nil, &github.Response{NextPage: 0}, nil
+	}
+	end := start + m.pageSize
+	resp := &github.Response{}
+	if end < len(m.comments) {
+		resp.NextPage = page + 1
+	} else {
+		end = len(m.comments)
+	}
+	return m.comments[start:end], resp, nil
 }
 
 func (m *mockIssuesService) CreateComment(_ context.Context, _, _ string, _ int, comment *github.IssueComment) (*github.IssueComment, *github.Response, error) {
@@ -508,4 +531,39 @@ func TestGitHubService_Send_UpdateExistingComment(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, issues.comments, 1)
 	assert.Equal(t, "updated comment\n<!-- argocd-notifications test-tag -->", *issues.comments[0].Body)
+}
+
+// A tagged comment past the first page of results must still be found and
+// updated in place — otherwise a busy PR gets a duplicate on every status change.
+func TestGitHubService_Send_UpdateExistingComment_BeyondFirstPage(t *testing.T) {
+	issues := &mockIssuesService{
+		pageSize: 1,
+		comments: []*github.IssueComment{
+			{ID: github.Ptr(int64(1)), Body: github.Ptr("unrelated review comment")},
+			{ID: github.Ptr(int64(2)), Body: github.Ptr("old status\n<!-- argocd-notifications test-tag -->")},
+		},
+	}
+	client := &mockGitHubClientImpl{
+		issues: issues,
+		prs:    &mockPullRequestsService{prs: []*github.PullRequest{{Number: github.Ptr(1)}}},
+		repos:  &mockRepositoriesService{},
+		checks: &mockChecksService{},
+	}
+
+	service := &gitHubService{client: client}
+
+	err := service.Send(Notification{
+		GitHub: &GitHubNotification{
+			repoURL:  "https://github.com/owner/repo",
+			revision: "abc123",
+			PullRequestComment: &GitHubPullRequestComment{
+				Content:    "new status",
+				CommentTag: "test-tag",
+			},
+		},
+	}, Destination{})
+
+	require.NoError(t, err)
+	assert.Len(t, issues.comments, 2) // updated in place, no duplicate appended
+	assert.Equal(t, "new status\n<!-- argocd-notifications test-tag -->", *issues.comments[1].Body)
 }

@@ -319,12 +319,6 @@ func (g *GitHubNotification) GetTemplater(name string, f texttemplate.FuncMap) (
 				return err
 			}
 			notification.GitHub.PullRequestComment.CommentTag = commentTagData.String()
-
-			if notification.GitHub.PullRequestComment.CommentTag != "" {
-				notification.GitHub.PullRequestComment.Content = fmt.Sprintf(contentFormat,
-					notification.GitHub.PullRequestComment.Content,
-					fmt.Sprintf(commentTagFormat, notification.GitHub.PullRequestComment.CommentTag))
-			}
 		}
 
 		if g.CheckRun != nil {
@@ -613,23 +607,33 @@ func (g gitHubService) Send(notification Notification, _ Destination) error {
 			if commentTag != "" {
 				// If comment tag is provided, try to find and update existing comment
 				tagPattern := fmt.Sprintf(commentTagFormat, commentTag)
-				comments, _, err := g.client.GetIssues().ListComments(
-					context.Background(),
-					u[0],
-					u[1],
-					pr.GetNumber(),
-					nil,
-				)
-				if err != nil {
-					return err
-				}
 
+				// Scan every page of comments: on a busy PR the tagged comment
+				// can sit past the first page, and missing it posts a duplicate
+				// instead of updating in place.
 				var existingComment *github.IssueComment
-				for _, comment := range comments {
-					if strings.Contains(comment.GetBody(), tagPattern) {
-						existingComment = comment
+				opts := &github.IssueListCommentsOptions{ListOptions: github.ListOptions{PerPage: 100}}
+				for {
+					comments, resp, err := g.client.GetIssues().ListComments(
+						context.Background(),
+						u[0],
+						u[1],
+						pr.GetNumber(),
+						opts,
+					)
+					if err != nil {
+						return err
+					}
+					for _, comment := range comments {
+						if strings.Contains(comment.GetBody(), tagPattern) {
+							existingComment = comment
+							break
+						}
+					}
+					if existingComment != nil || resp == nil || resp.NextPage == 0 {
 						break
 					}
+					opts.Page = resp.NextPage
 				}
 
 				if existingComment != nil {
